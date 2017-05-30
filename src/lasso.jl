@@ -9,12 +9,13 @@ function lasso_reg{T <: AbstractFloat, V <: AbstractVector}(
     mu             :: T    = one(T),
     backtrack_size :: T    = convert(T, 0.5),
     quiet          :: Bool = true
-) :: typeof(y)
+) FISTAResults{T,V} 
 
     n,p = size(x)
     @assert n == length(y) "Arguments x and y must have same number of rows"
     loss  = convert(T, Inf)
     loss0 = loss
+    iter  = 0
 
     # start timing
     tic()
@@ -74,10 +75,10 @@ function lasso_reg{T <: AbstractFloat, V <: AbstractVector}(
     end
 
     # get execution time
-    time = toq()
+    exec_time = toq()
 
     #return v.b
-    return FISTAResults{T}(time, loss, iter, v.b)
+    return FISTAResults(exec_time, loss, iter, v.b)
 end
 
 
@@ -86,6 +87,7 @@ function lasso_path{T <: AbstractFloat, V <: AbstractVector}(
     x :: AbstractMatrix{T},
     y :: V;
     K :: Int = 100,
+    lambdas        :: Vector{T} = compute_lambdas(x,y,K),
     max_iter       :: Int  = 1000,
     tol            :: T    = convert(T, 1e-4),
     mu             :: T    = one(T),
@@ -103,7 +105,8 @@ function lasso_path{T <: AbstractFloat, V <: AbstractVector}(
     betas = spzeros(T, p, K) 
 
     # allocate all intermediate arrays
-    v = FISTAVariables(x, y, K=K)
+    # insert dummy variable for MCP gamma
+    v = FISTAVariables(x, y, lambdas, convert(T, 3))
 
     # compute the path
     for i = 1:K
@@ -121,7 +124,7 @@ function lasso_path{T <: AbstractFloat, V <: AbstractVector}(
         betas[:,i] = sparsevec(output.beta)
 
         # cut path short if b is completely full
-        if countnz(b) == p
+        if countnz(output.beta) == p
             quiet || warn("Model at λ = ", λ, " is completely saturated.\nlasso_path will terminate early...\n")
             return betas[:,1:i]
         end
@@ -142,6 +145,7 @@ function one_fold{T <: Float}(
 	mu       :: T    = one(T),
 	backtrack_size :: T = convert(T, 0.5),
     quiet    :: Bool = true,
+    lambdas  :: Vector{T} = compute_lambdas(x,y,K)
 ) :: Vector{T}
 
     # make vector of indices for folds
@@ -156,7 +160,7 @@ function one_fold{T <: Float}(
     y_train = y[train_idx]
 
     # compute the regularization path on the training set
-    betas = lasso__path(x_train, y_train, K=K, tol=tol, max_iter=max_iter, quiet=quiet, mu=mu, backtrack_size=backtrack_size)
+    betas = lasso_path(x_train, y_train, K=K, tol=tol, max_iter=max_iter, quiet=quiet, mu=mu, backtrack_size=backtrack_size, lambdas=lambdas)
 
     # compute the mean out-of-sample error for the TEST set
     Xb = view(x, test_idx, :) * betas
@@ -180,6 +184,7 @@ function pfold{T <: Float}(
 	mu       :: T    = one(T),
 	backtrack_size :: T = convert(T, 0.5),
     quiet    :: Bool = true,
+    lambdas  :: Vector{T} = compute_lambdas(x,y,K)
 ) :: Vector{T}
 
     # how many CPU processes can pfold use?
@@ -194,7 +199,7 @@ function pfold{T <: Float}(
     nextidx() = (idx=i; i+=1; idx)
 
     # preallocate cell array for results
-    results = SharedArray(T, (length(path),q), pids=pids) :: SharedMatrix{T}
+    results = SharedArray(T, (K,q), pids=pids) :: SharedMatrix{T}
 
     # master process will distribute tasks to workers
     # master synchronizes results at end before returning
@@ -222,7 +227,7 @@ function pfold{T <: Float}(
                         # launch job on worker
                         # worker loads data from file paths and then computes the errors in one fold
                         r = remotecall_fetch(worker) do
-                                one_fold(x, y, K, folds, current_fold, tol=tol, max_iter=max_iter, backtrack_size=backtrack_size, mu=mu, quiet=quiet)
+                                one_fold(x, y, K, folds, current_fold, tol=tol, max_iter=max_iter, backtrack_size=backtrack_size, mu=mu, quiet=quiet, lambdas=lambdas)
                         end # end remotecall_fetch()
                         setindex!(results, r, :, current_fold)
                     end # end while
@@ -240,7 +245,7 @@ function cv_lasso{T <: Float}(
     y        :: DenseVector{T};
     q        :: Int  = cv_get_num_folds(3, 5),
 	K        :: Int  = 20,
-    lambdas  :: Vector{T} = 
+    lambdas  :: Vector{T} = compute_lambdas(x,y,K), 
     folds    :: DenseVector{Int} = cv_get_folds(sdata(y),q),
     pids     :: Vector{Int}      = procs(),
     tol      :: T    = convert(T, 1e-4),
@@ -261,24 +266,26 @@ function cv_lasso{T <: Float}(
     # want to compute a path for each fold
     # the folds are computed asynchronously over processes enumerated by pids
     # master process then reduces errors across folds and returns MSEs
-    mses = pfold(x, y, K, folds, q, pids=pids, tol=tol, max_iter=max_iter, backtrack_size=backtrack=size, mu=mu, quiet=quiet)
+    mses = pfold(x, y, K, folds, q, pids=pids, tol=tol, max_iter=max_iter, backtrack_size=backtrack=backtrack_size, mu=mu, quiet=quiet, lambdas=lambdas)
 
     # what is the best model size?
     # if there are multiple model sizes of EXACTLY the same MSE,
     # then this chooses the smaller of the two
     i = indmin(mses)
-    k = path[i] :: Int
+#    k = path[i] :: Int
     λ = lambdas[i] :: T
 #    path = vec(mapslices(
 
     # print results
-    !quiet && print_cv_results(mses, path, k)
+#    !quiet && print_cv_results(mses, path, k)
 
     # refit the best model
 #    b, bidx = refit_iht(sdata(x), sdata(y), k, tol=tol, max_iter=max_iter, max_step=max_step, quiet=quiet)
-    output = L0_reg(sdata(x), sdata(y), k, max_iter=max_iter, max_step = max_step, quiet=quiet, tol=tol)
+    output = lasso_reg(sdata(x), sdata(y), λ, K=K, max_iter=max_iter, backtrack_size=backtrack_size, quiet=quiet, tol=tol, mu=mu)
     bidx  = find(output.beta)
     b     = output.beta[bidx]
+    k     = countnz(output.beta)
 
-    return FISTACrossvalidationResults(mses, path, λ, b, bidx, k)
+    #return FISTACrossvalidationResults(mses, path, λ, b, bidx, k)
+    return FISTACrossvalidationResults(mses, λ, b, bidx, k)
 end

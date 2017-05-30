@@ -18,19 +18,46 @@ end
 
 @inline function compute_lambdas{T <: AbstractFloat}(
     λmax :: T,
-    ε    :: T;
+    ε    :: T,
     K    :: Int = 100
 ) :: Vector{T}
     λmin = λmax*ε
-    lambdas = collect(linspace(λmax, λmin, K))
-    return lambdas
+    Λ = collect(linspace(λmax, λmin, K))
+    return Λ
+end
+
+function compute_lambdas{T <: AbstractFloat}(
+    x :: AbstractMatrix{T},
+    y :: AbstractVector{T},
+    K :: Int = 100,
+    ε :: T   = convert(T, 1e-3)
+) :: Vector{T}
+
+    # problem dimensions?
+    n,p = size(x)
+    @assert n == length(y) "Arguments x and y must have same number of rows"
+
+    # use Jerome Friedman's approach to select reasonable estimates of λ
+    # first compute scaled copies of x and y
+    sy = std(y, corrected=false)
+    my = mean(y)
+    sx = std(x, corrected=false, 1)
+    mx = mean(x, 1)
+    x_scaled = (x .- mx) ./ sx
+    y_scaled = (y .- my) ./ sy
+
+    # λ_max is maximum absolute column sum of x'*y, divided by n
+    λmax = maxabs(x_scaled' * y_scaled) / n
+
+    # generate K λs inbetween the previous two λs
+    return compute_lambdas(λmax, ε, K)
 end
 
 # ----------------------------------------- #
 # functions to handle FISTA output
 
 # an object that houses results returned from an FISTA run
-immutable FISTAResults{T <: Float, V <: DenseVector}
+immutable FISTAResults{T <: AbstractFloat, V <: DenseVector}
     time :: T
     loss :: T
     iter :: Int
@@ -40,7 +67,7 @@ immutable FISTAResults{T <: Float, V <: DenseVector}
 end
 
 # strongly typed external constructor for FISTAResults
-function FISTAResults{T <: Float}(
+function FISTAResults{T <: AbstractFloat}(
     time :: T,
     loss :: T,
     iter :: Int,
@@ -127,27 +154,12 @@ FISTAVariables{T <: AbstractFloat}(x::DenseMatrix{T},y::DenseVector{T},lambdas::
 
 function FISTAVariables{T <: AbstractFloat}(
     x   :: DenseMatrix{T},
-    y   :: DenseVector{T};
+    y   :: DenseVector{T},
     K   :: Int = 100,
     tol :: T = convert(T, 1e-3)
 )
-    # use Jerome Friedman's approach to select reasonable estimates of lambda
-    # first compute scaled copies of x and y
-    sy = std(y, corrected=false)
-    my = mean(y)
-    sx = std(x, corrected=false, 1)
-    mx = mean(x, 1)
-    x_scaled = (x .- mx) ./ sx
-    y_scaled = (y .- my) ./ sy
-
-    # lambda_max is maximum absolute column sum of x'*y, divided by n
-    lambda_max = maxabs(x_scaled' * y_scaled) / n
-
-    # lambda_min is some small scaled copy of lambda_max
-    lambda_min = tol*lambda_max
-
-    # generate K lambdas inbetween the previous two lambdas
-    lambdas = collect(linspace(lambda_max, lambda_min, K))
+    # compute lambdas
+    lambdas = compute_lambdas(x, y, K, tol)
 
     # use Patrick Breheny's default of 3 for gamma
     gamma = convert(T, 3)
@@ -162,32 +174,60 @@ end
 # subroutine to compute a default number of folds
 @inline cv_get_num_folds(nmin::Int, nmax::Int) = max(nmin, min(Sys.CPU_CORES::Int, nmax))
 
+"Can also be called with an `Int` argument `n` instead of the data vector `y`."
+function cv_get_folds(n::Int, q::Int)
+    m, r = divrem(n, q)
+    shuffle!([repmat(1:q, m); 1:r])
+end
+
+"""
+CREATE UNSTRATIFIED CROSSVALIDATION PARTITION
+
+    cv_get_folds(y,q) -> Vector{Int}
+
+This function will partition the `n` components of `y` into `q` disjoint sets for unstratified `q`-fold crossvalidation.
+
+Arguments:
+
+- `y` is the `n`-vector to partition.
+- `q` is the number of disjoint sets in the partition.
+"""
+function cv_get_folds(y::DenseVector, q::Int)
+    n, r = divrem(length(y), q)
+    shuffle!([repmat(1:q, n); 1:r])
+end
+
 
 # return type for crossvalidation
-immutable FISTACrossvalidationResults{T <: Float}
+immutable FISTACrossvalidationResults{T <: AbstractFloat}
     mses   :: Vector{T}
-    path   :: Vector{Int}
-    lambda :: Vector{T}
+#    path   :: Vector{Int}
+    #lambda :: Vector{T}
+    lambda :: T
     b      :: Vector{T}
     bidx   :: Vector{Int}
     k      :: Int
     bids   :: Vector{String}
 
-    FISTACrossvalidationResults(mses::Vector{T}, path::Vector{Int}, lambda::Vector{T}, b::Vector{T}, bidx::Vector{Int}, k::Int, bids::Vector{String}) = new(mses, path, lambda, b, bidx, k, bids)
+    #FISTACrossvalidationResults(mses::Vector{T}, path::Vector{Int}, lambda::Vector{T}, b::Vector{T}, bidx::Vector{Int}, k::Int, bids::Vector{String}) = new(mses, path, lambda, b, bidx, k, bids)
+    #FISTACrossvalidationResults(mses::Vector{T}, lambda::Vector{T}, b::Vector{T}, bidx::Vector{Int}, k::Int, bids::Vector{String}) = new(mses, lambda, b, bidx, k, bids)
+    FISTACrossvalidationResults(mses::Vector{T}, lambda::T, b::Vector{T}, bidx::Vector{Int}, k::Int, bids::Vector{String}) = new(mses, lambda, b, bidx, k, bids)
 end
 
 # constructor for when bids are not available
 # simply makes vector of "V$i" where $i are drawn from bidx
-function FISTACrossvalidationResults{T <: Float}(
+function FISTACrossvalidationResults{T <: AbstractFloat}(
     mses   :: Vector{T},
-    path   :: Vector{Int},
-    lambda :: Vector{T},
+#    path   :: Vector{Int},
+    #lambda :: Vector{T},
+    lambda :: T,
     b      :: Vector{T},
     bidx   :: Vector{Int},
     k      :: Int
 )
     bids = convert(Vector{String}, ["V" * "$i" for i in bidx]) :: Vector{String}
-    FISTACrossvalidationResults{eltype(mses)}(mses, path, lambda, b, bidx, k, bids)
+    #FISTACrossvalidationResults{eltype(mses)}(mses, path, lambda, b, bidx, k, bids)
+    FISTACrossvalidationResults{eltype(mses)}(mses, lambda, b, bidx, k, bids)
 end
 
 # function to view an FISTACrossvalidationResults object
@@ -202,4 +242,5 @@ end
 function Gadfly.plot(x::FISTACrossvalidationResults)
     df = DataFrame(ModelSize=x.path, MSE=x.mses)
     plot(df, x="ModelSize", y="MSE", xintercept=[x.k], Geom.line, Geom.vline(color=colorant"red"), Guide.xlabel("Model size"), Guide.ylabel("MSE"), Guide.title("MSE versus model size"))
+#    plot(df, x="ModelSize", y="MSE", xintercept=[x.k], Geom.line, Geom.vline(color="red"), Guide.xlabel("Model size"), Guide.ylabel("MSE"), Guide.title("MSE versus model size"))
 end
